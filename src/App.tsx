@@ -2,12 +2,17 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   Bike,
   Building2,
+  Calendar,
   Camera,
   Check,
   CheckCircle2,
   Copy,
   Download,
   FileCode,
+  FileSpreadsheet,
+  FileText,
+  Filter,
+  History,
   KeyRound,
   Navigation,
   Package,
@@ -15,6 +20,7 @@ import {
   Plus,
   QrCode,
   RefreshCw,
+  Search,
   ShieldCheck,
   Smartphone,
   Sparkles,
@@ -46,10 +52,13 @@ import { CourierStoryModal } from './components/CourierStoryModal';
 import { SealCaptureModal } from './components/SealCaptureModal';
 import { QrCodeGraphic } from './components/QrCodeGraphic';
 import { HostingerExportModal } from './components/HostingerExportModal';
+import { DispatchAnalyticsCharts } from './components/DispatchAnalyticsCharts';
+import { OrderChatPanel, getEffectiveOrderMessages } from './components/OrderChatPanel';
 import { useOnlineStatus, usePWAInstall } from './hooks/usePWAInstall';
+import { exportConsolidatedPdfReport } from './utils/exportPdfReport';
 
-const STORAGE_KEY_ORDERS = 'rede_vip_express_maputo_orders_v2';
-const STORAGE_KEY_ROLE = 'rede_vip_express_maputo_role_v2';
+const STORAGE_KEY_ORDERS = 'rede_vip_express_maputo_orders_v5';
+const STORAGE_KEY_ROLE = 'rede_vip_express_maputo_role_v5';
 
 export function formatMetical(amount: number): string {
   return `${amount.toLocaleString('pt-MZ', {
@@ -59,7 +68,7 @@ export function formatMetical(amount: number): string {
 }
 
 export default function App() {
-  // Persistent state in LocalStorage (v2 centered on Maputo & Metical)
+  // Persistent state in LocalStorage (v3 with Maputo multi-date history & Metical)
   const [roleView, setRoleView] = useState<RoleView>(() => {
     const saved = localStorage.getItem(STORAGE_KEY_ROLE);
     if (saved === 'client' || saved === 'driver' || saved === 'dispatch') return saved;
@@ -71,7 +80,7 @@ export default function App() {
       const saved = localStorage.getItem(STORAGE_KEY_ORDERS);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].dateIso) return parsed;
       }
     } catch {
       // Fallback to initial Maputo orders
@@ -87,6 +96,7 @@ export default function App() {
   // Modals state
   const [storyCourier, setStoryCourier] = useState<CourierProfile | null>(null);
   const [sealModalOrder, setSealModalOrder] = useState<DeliveryOrder | null>(null);
+  const [previewSealOrder, setPreviewSealOrder] = useState<DeliveryOrder | null>(null);
   const [isHostingerModalOpen, setIsHostingerModalOpen] = useState<boolean>(false);
   const [showIOSInstallModal, setShowIOSInstallModal] = useState<boolean>(false);
   const [showMatrixDrawer, setShowMatrixDrawer] = useState<boolean>(false);
@@ -108,7 +118,8 @@ export default function App() {
   } | null>(null);
   const [driverFilter, setDriverFilter] = useState<'all' | 'vip' | 'regular'>('all');
 
-  // Dispatch Web Panel State
+  // Dispatch Web Panel State (Active Monitor vs. Histórico de Entregas)
+  const [dispatchSubView, setDispatchSubView] = useState<'operations' | 'history'>('operations');
   const [commissionPercent, setCommissionPercent] = useState<number>(20); // 15% to 25% per Business Plan
   const [hasDedicatedFleetSub, setHasDedicatedFleetSub] = useState<boolean>(true);
   const [hasSponsoredFeed, setHasSponsoredFeed] = useState<boolean>(true);
@@ -117,6 +128,12 @@ export default function App() {
   const [dispatchDest, setDispatchDest] = useState<number>(1);
   const [dispatchCustomer, setDispatchCustomer] = useState<string>('Eng. Amélia Mondlane');
   const [dispatchCategory, setDispatchCategory] = useState<ServiceCategory>('vip');
+
+  // Historical Deliveries Filter State (Histórico de Entregas)
+  const [historyStartDate, setHistoryStartDate] = useState<string>('2026-10-21');
+  const [historyEndDate, setHistoryEndDate] = useState<string>('2026-10-25');
+  const [historyCategoryFilter, setHistoryCategoryFilter] = useState<'all' | 'vip' | 'regular'>('all');
+  const [historySearchQuery, setHistorySearchQuery] = useState<string>('');
 
   // PWA & Connectivity Hooks
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
@@ -193,9 +210,8 @@ export default function App() {
     const rawDist = Math.sqrt(dLat * dLat + dLng * dLng) * 1.35;
     const distanceKm = Math.max(1.2, Number(rawDist.toFixed(1)));
 
-    // Tarifa em Meticais (MT): Base 130 MT + 45 MT por km
     const basePrice = Math.round(130 + distanceKm * 45);
-    const vipSupplement = 150; // Taxa prioritária fixa Classe VIP em Meticais (+150 MT)
+    const vipSupplement = 150;
     const regularTotal = basePrice;
     const vipTotal = basePrice + vipSupplement;
 
@@ -213,6 +229,8 @@ export default function App() {
     };
   }, [originIdx, destIdx]);
 
+  const todayIso = '2026-10-25';
+
   // Create new order (from Client view)
   const handleCreateClientOrder = (e: React.FormEvent) => {
     e.preventDefault();
@@ -229,6 +247,7 @@ export default function App() {
     const newOrder: DeliveryOrder = {
       id: `ord-${orderNum}-${Date.now()}`,
       code,
+      dateIso: todayIso,
       createdAt: new Date().toLocaleTimeString('pt-MZ', { hour: '2-digit', minute: '2-digit' }),
       restaurantName: origin.label,
       customerName: customerName.trim() || 'Cliente Executivo Maputo',
@@ -257,19 +276,71 @@ export default function App() {
     if (soundEnabled) playAlertSound(isVip ? 'vip' : 'regular');
   };
 
+  // Send Contextual Chat Message (Client <-> Driver) persisted in order session
+  const handleSendOrderChatMessage = (
+    orderId: string,
+    sender: 'client' | 'driver',
+    text: string,
+    contextTag?: string
+  ) => {
+    const nowTime = new Date().toLocaleTimeString('pt-MZ', {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+    setOrders((prev) =>
+      prev.map((o) => {
+        if (o.id !== orderId) return o;
+        const c = couriers.find((cr) => cr.id === o.assignedCourierId) || couriers[0];
+        const existingMessages = getEffectiveOrderMessages(o, c);
+        const senderName = sender === 'client' ? o.customerName : c.name;
+
+        return {
+          ...o,
+          chatMessages: [
+            ...existingMessages,
+            {
+              id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              sender,
+              senderName,
+              text,
+              timestamp: nowTime,
+              contextTag,
+            },
+          ],
+        };
+      })
+    );
+  };
+
   // Confirm Seal Photo in Driver View
   const handleConfirmSeal = (orderId: string, record: SealInspectionRecord) => {
     setOrders((prev) =>
-      prev.map((o) =>
-        o.id === orderId
-          ? {
-              ...o,
-              sealInspection: record,
-              status: 'in_transit',
-              routeProgress: Math.max(28, o.routeProgress),
-            }
-          : o
-      )
+      prev.map((o) => {
+        if (o.id !== orderId) return o;
+        const c = couriers.find((cr) => cr.id === o.assignedCourierId) || couriers[0];
+        const existingMessages = getEffectiveOrderMessages(o, c);
+
+        return {
+          ...o,
+          sealInspection: record,
+          status: 'in_transit',
+          routeProgress: Math.max(28, o.routeProgress),
+          chatMessages: [
+            ...existingMessages,
+            {
+              id: `msg-seal-${Date.now()}`,
+              sender: 'driver',
+              senderName: c.name,
+              text: `Fotografia do Lacre #${record.sealCode} registada na recolha. Baú térmico estabilizado a ${record.compartmentTempHot.toFixed(
+                1
+              )}°C (Quente) / ${record.compartmentTempCold.toFixed(1)}°C (Frio). A iniciar rota para o destino!`,
+              timestamp: record.capturedAt.slice(0, 5),
+              contextTag: `Lacre #${record.sealCode}`,
+            },
+          ],
+        };
+      })
     );
     setSealModalOrder(null);
     if (soundEnabled) playAlertSound('success');
@@ -292,19 +363,32 @@ export default function App() {
         minute: '2-digit',
       });
       setOrders((prev) =>
-        prev.map((o) =>
-          o.id === order.id
-            ? {
-                ...o,
-                status: 'delivered',
-                routeProgress: 100,
-                deliveredAt: nowStr,
-                courierLocation: { lat: o.destination.lat, lng: o.destination.lng },
-                clientRating: 5,
-                driverRating: 5,
-              }
-            : o
-        )
+        prev.map((o) => {
+          if (o.id !== order.id) return o;
+          const c = couriers.find((cr) => cr.id === o.assignedCourierId) || couriers[0];
+          const existingMessages = getEffectiveOrderMessages(o, c);
+
+          return {
+            ...o,
+            status: 'delivered',
+            routeProgress: 100,
+            deliveredAt: nowStr,
+            courierLocation: { lat: o.destination.lat, lng: o.destination.lng },
+            clientRating: 5,
+            driverRating: 5,
+            chatMessages: [
+              ...existingMessages,
+              {
+                id: `msg-del-${Date.now()}`,
+                sender: 'system',
+                senderName: 'Rede Express Maputo',
+                text: `Entrega autenticada com sucesso via PIN ${order.pinCode} às ${nowStr}. Obrigado por utilizar a Rede Express Maputo!`,
+                timestamp: nowStr,
+                contextTag: 'PIN Validado',
+              },
+            ],
+          };
+        })
       );
       setDriverPinInput('');
       setPinFeedback({
@@ -350,6 +434,7 @@ export default function App() {
     const newOrder: DeliveryOrder = {
       id: `ord-${num}-${Date.now()}`,
       code,
+      dateIso: todayIso,
       createdAt: new Date().toLocaleTimeString('pt-MZ', { hour: '2-digit', minute: '2-digit' }),
       restaurantName: origin.label,
       customerName: dispatchCustomer.trim() || 'Cliente Restaurante Maputo',
@@ -424,6 +509,7 @@ export default function App() {
       return {
         id: `batch-${num}-${Date.now()}-${idx}`,
         code,
+        dateIso: todayIso,
         createdAt: nowStr,
         restaurantName: cfg.origin.label,
         customerName: cfg.customer,
@@ -454,14 +540,14 @@ export default function App() {
     if (soundEnabled) playAlertSound('vip');
   };
 
-  // Financial Metrics in Meticais (MT) for Painel Web de Despacho (Section 5 of Business Plan)
+  // Financial Metrics in Meticais (MT) for Painel Web de Despacho
   const financialMetrics = useMemo(() => {
     const grossVolume = orders.reduce((acc, o) => acc + o.totalPrice, 0);
     const baseDeliveryVolume = orders.reduce((acc, o) => acc + o.basePrice, 0);
     const vipSupplementRetained = orders.reduce((acc, o) => acc + o.vipSupplement, 0);
     const intermediationFee = (baseDeliveryVolume * commissionPercent) / 100;
-    const dedicatedFleetDailyShare = hasDedicatedFleetSub ? 1200 : 0; // 1.200 MT / dia
-    const sponsoredFeedDailyShare = hasSponsoredFeed ? 750 : 0; // 750 MT / dia
+    const dedicatedFleetDailyShare = hasDedicatedFleetSub ? 1200 : 0;
+    const sponsoredFeedDailyShare = hasSponsoredFeed ? 750 : 0;
     const platformTotalRevenue =
       intermediationFee +
       vipSupplementRetained +
@@ -487,10 +573,56 @@ export default function App() {
     };
   }, [orders, commissionPercent, hasDedicatedFleetSub, hasSponsoredFeed]);
 
-  // Export CSV report in Meticais for Dispatch Panel
-  const handleExportCsvReport = () => {
+  // Filtered Delivered Orders for the "Histórico de Entregas" screen
+  const filteredDeliveredHistory = useMemo(() => {
+    return orders.filter((o) => {
+      if (o.status !== 'delivered') return false;
+      if (historyStartDate && o.dateIso < historyStartDate) return false;
+      if (historyEndDate && o.dateIso > historyEndDate) return false;
+      if (historyCategoryFilter !== 'all' && o.category !== historyCategoryFilter) return false;
+      if (historySearchQuery.trim()) {
+        const q = historySearchQuery.toLowerCase();
+        const matchCode = o.code.toLowerCase().includes(q);
+        const matchRest = o.restaurantName.toLowerCase().includes(q);
+        const matchCust = o.customerName.toLowerCase().includes(q);
+        const matchDest = o.destination.label.toLowerCase().includes(q);
+        if (!matchCode && !matchRest && !matchCust && !matchDest) return false;
+      }
+      return true;
+    });
+  }, [orders, historyStartDate, historyEndDate, historyCategoryFilter, historySearchQuery]);
+
+  // Consolidated Summary Metrics for Filtered History
+  const historySummaryMetrics = useMemo(() => {
+    const count = filteredDeliveredHistory.length;
+    const vipCount = filteredDeliveredHistory.filter((o) => o.category === 'vip').length;
+    const regularCount = filteredDeliveredHistory.filter((o) => o.category === 'regular').length;
+    const grossTotal = filteredDeliveredHistory.reduce((acc, o) => acc + o.totalPrice, 0);
+    const baseTotal = filteredDeliveredHistory.reduce((acc, o) => acc + o.basePrice, 0);
+    const vipSuppTotal = filteredDeliveredHistory.reduce((acc, o) => acc + o.vipSupplement, 0);
+    const commissionTotal = (baseTotal * commissionPercent) / 100;
+    const platformRetained = commissionTotal + vipSuppTotal;
+    const partnerNet = grossTotal - platformRetained;
+
+    return {
+      count,
+      vipCount,
+      regularCount,
+      grossTotal,
+      baseTotal,
+      vipSuppTotal,
+      commissionTotal,
+      platformRetained,
+      partnerNet,
+    };
+  }, [filteredDeliveredHistory, commissionPercent]);
+
+  // Export CSV report in Meticais (supports either all orders or filtered history)
+  const handleExportCsvReport = (targetOrders: DeliveryOrder[], filenamePrefix = 'relatorio_despacho_maputo') => {
     const headers = [
       'Codigo',
+      'Data_Entrega',
+      'Hora_Conclusao',
       'Categoria',
       'Status',
       'Restaurante_Origem_Maputo',
@@ -501,14 +633,16 @@ export default function App() {
       'Suplemento_VIP_MT',
       'Total_MT',
     ];
-    const rows = orders.map((o) => [
+    const rows = targetOrders.map((o) => [
       o.code,
+      o.dateIso,
+      o.deliveredAt || o.createdAt,
       o.category.toUpperCase(),
       o.status,
       `"${o.restaurantName}"`,
       `"${o.customerName}"`,
       o.pinCode,
-      o.sealInspection?.sealCode || 'Pendente',
+      o.sealInspection?.sealCode || 'Verificado',
       o.basePrice.toFixed(2),
       o.vipSupplement.toFixed(2),
       o.totalPrice.toFixed(2),
@@ -518,9 +652,20 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `relatorio_despacho_maputo_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `${filenamePrefix}_${historyStartDate || 'geral'}_${historyEndDate || ''}.csv`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  // Export Consolidated PDF Report
+  const handleExportPdf = (targetOrders: DeliveryOrder[]) => {
+    exportConsolidatedPdfReport({
+      orders: targetOrders,
+      couriers,
+      startDate: historyStartDate,
+      endDate: historyEndDate,
+      commissionPercent,
+    });
   };
 
   const handleResetDemoData = () => {
@@ -591,19 +736,31 @@ export default function App() {
           </button>
           <button
             type="button"
-            onClick={() => setRoleView('dispatch')}
+            onClick={() => {
+              setRoleView('dispatch');
+              setDispatchSubView('operations');
+            }}
             className={`hover:text-amber-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              roleView === 'dispatch' ? 'text-amber-400 underline underline-offset-8' : ''
+              roleView === 'dispatch' && dispatchSubView === 'operations'
+                ? 'text-amber-400 underline underline-offset-8'
+                : ''
             }`}
           >
             Painel Despacho
           </button>
           <button
             type="button"
-            onClick={() => setShowMatrixDrawer((v) => !v)}
-            className="hover:text-amber-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            onClick={() => {
+              setRoleView('dispatch');
+              setDispatchSubView('history');
+            }}
+            className={`hover:text-amber-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              roleView === 'dispatch' && dispatchSubView === 'history'
+                ? 'text-amber-400 underline underline-offset-8'
+                : ''
+            }`}
           >
-            Matriz VIP
+            Histórico Entregas
           </button>
           <button
             type="button"
@@ -644,7 +801,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* WORKSPACE ROLE SWITCHER & SIMULATION BAR (Below the fold / Header) */}
+      {/* WORKSPACE ROLE SWITCHER & SIMULATION BAR */}
       <section className="max-w-7xl w-full mx-auto px-4 sm:px-8 pt-6">
         <div className="rounded-2xl bg-slate-900/90 border border-slate-800 p-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
           <div className="space-y-1">
@@ -654,7 +811,10 @@ export default function App() {
             <h1 className="font-display text-xl sm:text-2xl font-bold text-white">
               {roleView === 'client' && '1. Visão do Cliente — Maputo VIP & Regular (MT)'}
               {roleView === 'driver' && '2. Visão do Motorista / Estafeta — Inspeção de Lacre & PIN'}
-              {roleView === 'dispatch' && '3. Painel Web de Despacho — Gestor & Restaurantes Maputo'}
+              {roleView === 'dispatch' &&
+                (dispatchSubView === 'history'
+                  ? '3. Painel Gestor / Restaurante — Histórico de Entregas & Exportação PDF/CSV'
+                  : '3. Painel Web de Despacho — Gestor & Restaurantes Maputo')}
             </h1>
           </div>
 
@@ -707,9 +867,18 @@ export default function App() {
                 }`}
               >
                 <Building2 className="w-3.5 h-3.5" />
-                <span>3. Despacho Web</span>
+                <span>3. Despacho &amp; Histórico</span>
               </button>
             </div>
+
+            {/* Matrix Toggle Button */}
+            <button
+              type="button"
+              onClick={() => setShowMatrixDrawer((v) => !v)}
+              className="min-h-[40px] px-3 py-1.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-xs font-medium text-slate-300 cursor-pointer whitespace-nowrap shrink-0"
+            >
+              Matriz VIP
+            </button>
 
             {/* Simulation & Sound Utility Buttons */}
             <button
@@ -753,7 +922,7 @@ export default function App() {
         </div>
       </section>
 
-      {/* COLLAPSIBLE BUSINESS PLAN MATRIX DRAWER (Matriz de Categorias VIP vs. Regular) */}
+      {/* COLLAPSIBLE BUSINESS PLAN MATRIX DRAWER */}
       {showMatrixDrawer && (
         <section className="max-w-7xl w-full mx-auto px-4 sm:px-8 pt-4">
           <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
@@ -842,9 +1011,7 @@ export default function App() {
          ===================================================================== */}
       {roleView === 'client' && (
         <main className="max-w-7xl w-full mx-auto px-4 sm:px-8 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Left Column (5 cols on desktop): Order Creation + Category Selector + Fleet Stories */}
           <div className="lg:col-span-5 space-y-6">
-            {/* Order Creation Card */}
             <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-5">
               <div className="flex items-center justify-between">
                 <div>
@@ -931,7 +1098,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* SELETOR DE CATEGORIA: Classe Regular vs. Classe VIP (Express Premium) */}
+                {/* SELETOR DE CATEGORIA: Classe Regular vs. Classe VIP */}
                 <div className="space-y-2.5 pt-1">
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-semibold text-slate-200">
@@ -943,7 +1110,6 @@ export default function App() {
                   </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {/* Option 1: Classe Regular */}
                     <button
                       type="button"
                       onClick={() => setSelectedCategory('regular')}
@@ -973,7 +1139,6 @@ export default function App() {
                       </div>
                     </button>
 
-                    {/* Option 2: Classe VIP (Express Premium) */}
                     <button
                       type="button"
                       onClick={() => setSelectedCategory('vip')}
@@ -1027,17 +1192,15 @@ export default function App() {
               </form>
             </div>
 
-            {/* PERFIL DA FROTA & COMPONENTE ESTILO "STORIES" (5 SEGUNDOS SOB DEMANDA) */}
+            {/* PERFIL DA FROTA & STORIES 5S */}
             <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="font-display text-base font-bold text-white">
-                    Frota Homologada em Maputo — Stories (5s)
-                  </h3>
-                  <p className="text-xs text-slate-400">
-                    Toque num estafeta para ver o vídeo/apresentação de 5s, matrícula e sensor térmico
-                  </p>
-                </div>
+              <div>
+                <h3 className="font-display text-base font-bold text-white">
+                  Frota Homologada em Maputo — Stories (5s)
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Toque num estafeta para ver o vídeo/apresentação de 5s, matrícula e sensor térmico
+                </p>
               </div>
 
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -1057,7 +1220,6 @@ export default function App() {
                           : 'bg-slate-950/70 border-slate-800 hover:border-slate-700'
                       }`}
                     >
-                      {/* Story Ring Avatar */}
                       <div
                         className={`w-14 h-14 rounded-full p-0.5 border-2 flex items-center justify-center relative ${
                           isVip ? 'border-amber-400' : 'border-emerald-400'
@@ -1094,9 +1256,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Right Column (7 cols on desktop): Live 2D Map Tracking + Active Order + PIN & QR Code + Seal Photo */}
           <div className="lg:col-span-7 space-y-6">
-            {/* Order Selector Strip */}
             <div className="flex items-center gap-2 overflow-x-auto pb-1">
               {orders.map((ord) => {
                 const isSelected = ord.id === activeOrder.id;
@@ -1130,7 +1290,6 @@ export default function App() {
               })}
             </div>
 
-            {/* 2D Vector Map Centered on Maputo with Real-time Animated Courier */}
             <LeafletMap
               activeOrder={activeOrder}
               couriers={couriers}
@@ -1138,15 +1297,13 @@ export default function App() {
               onOpenCourierStory={(c) => setStoryCourier(c)}
             />
 
-            {/* Active Delivery Detail + Courier Inspection Trigger + Security PIN & QR Code */}
             {activeOrder && (
               <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
-                {/* Left 7 Cols: Assigned Courier Profile, Thermal Sensor & Seal Photo */}
                 <div className="md:col-span-7 rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <div className="text-xs text-slate-400">
-                        {activeOrder.code} ·{' '}
+                        {activeOrder.code} · {activeOrder.dateIso} ·{' '}
                         <span
                           className={
                             activeOrder.category === 'vip'
@@ -1175,7 +1332,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Assigned Courier Card with 5s Story Button */}
                   <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-3">
                     <div className="flex items-center gap-3 min-w-0">
                       <div
@@ -1211,7 +1367,6 @@ export default function App() {
                     </button>
                   </div>
 
-                  {/* Fotografia de Lacre e Inspeção Proof */}
                   <div className="space-y-2">
                     <div className="flex items-center justify-between text-xs">
                       <span className="font-semibold text-slate-200">
@@ -1259,7 +1414,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Right 5 Cols: PIN de 4 Dígitos & QR Code de Validação da Entrega */}
                 <div className="md:col-span-5 rounded-2xl bg-slate-900 border border-slate-800 p-5 flex flex-col justify-between gap-4">
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
@@ -1277,7 +1431,6 @@ export default function App() {
                     </p>
                   </div>
 
-                  {/* High-contrast 4-digit PIN Box + QR Code */}
                   <div className="flex flex-col items-center gap-3 p-4 rounded-2xl bg-slate-950 border border-slate-800">
                     <div className="text-[11px] text-slate-400">
                       PIN de 4 Dígitos ({activeOrder.code})
@@ -1331,11 +1484,10 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Bilateral Star Rating when Delivered */}
                   {activeOrder.status === 'delivered' && (
                     <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2">
                       <div className="text-xs font-semibold text-emerald-300">
-                        ✓ Entrega Finalizada às {activeOrder.deliveredAt}
+                        ✓ Entrega Finalizada em {activeOrder.dateIso} às {activeOrder.deliveredAt}
                       </div>
                       <div className="flex items-center justify-between text-xs text-slate-300">
                         <span>Avaliação Bilateral:</span>
@@ -1362,6 +1514,17 @@ export default function App() {
                     </div>
                   )}
                 </div>
+
+                {/* Contextual Quick Chat in Client View */}
+                <div className="md:col-span-12">
+                  <OrderChatPanel
+                    order={activeOrder}
+                    courier={activeCourier}
+                    currentRole="client"
+                    onSendMessage={handleSendOrderChatMessage}
+                    onSwitchRole={(target) => setRoleView(target)}
+                  />
+                </div>
               </div>
             )}
           </div>
@@ -1373,7 +1536,6 @@ export default function App() {
          ===================================================================== */}
       {roleView === 'driver' && (
         <main className="max-w-7xl w-full mx-auto px-4 sm:px-8 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Left 5 Cols: Feed de Solicitações (Diferenciação Sonora/Visual VIP vs Regular) */}
           <div className="lg:col-span-5 space-y-4">
             <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
               <div className="flex items-center justify-between gap-2">
@@ -1395,7 +1557,6 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Filter Tabs */}
               <div className="flex items-center gap-1 p-1 bg-slate-950 rounded-xl border border-slate-800">
                 {(['all', 'vip', 'regular'] as const).map((flt) => (
                   <button
@@ -1415,7 +1576,6 @@ export default function App() {
                 ))}
               </div>
 
-              {/* Orders Feed List */}
               <div className="space-y-3 max-h-[540px] overflow-y-auto pr-1">
                 {orders
                   .filter((o) => (driverFilter === 'all' ? true : o.category === driverFilter))
@@ -1474,7 +1634,7 @@ export default function App() {
                         <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400">
                           <span>{formatStatusLabel(order.status)}</span>
                           <span className="font-mono tabular-nums">
-                            {order.distanceKm} km · SLA {order.slaTargetMinutes}m
+                            {order.dateIso} · {order.distanceKm} km
                           </span>
                         </div>
                       </div>
@@ -1484,11 +1644,9 @@ export default function App() {
             </div>
           </div>
 
-          {/* Right 7 Cols: Painel de Navegação + Etapa de Recolha (Lacre) + Conclusão (PIN/QR) */}
           <div className="lg:col-span-7 space-y-6">
             {activeOrder && (
               <>
-                {/* 3-Step Route Progress Header */}
                 <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
@@ -1517,7 +1675,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Stepper: A caminho do local > Recolhido & Lacrado > A caminho do destino > Entregue */}
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
                     <button
                       type="button"
@@ -1588,7 +1745,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Live Navigation Map */}
                 <LeafletMap
                   activeOrder={activeOrder}
                   couriers={couriers}
@@ -1596,7 +1752,6 @@ export default function App() {
                   heightClass="h-[320px]"
                 />
 
-                {/* CONCLUSÃO DE ENTREGA: Validação Obrigatória por PIN de 4 Dígitos ou Leitor QR Code */}
                 <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
@@ -1621,7 +1776,8 @@ export default function App() {
                             Entrega {activeOrder.code} Autenticada e Concluída
                           </div>
                           <div className="text-xs text-slate-300">
-                            PIN {activeOrder.pinCode} validado às {activeOrder.deliveredAt} · Lacre{' '}
+                            PIN {activeOrder.pinCode} validado em {activeOrder.dateIso} às{' '}
+                            {activeOrder.deliveredAt} · Lacre{' '}
                             {activeOrder.sealInspection?.sealCode || 'Verificado'}
                           </div>
                         </div>
@@ -1681,6 +1837,15 @@ export default function App() {
                     </div>
                   )}
                 </div>
+
+                {/* Contextual Quick Chat in Driver View */}
+                <OrderChatPanel
+                  order={activeOrder}
+                  courier={activeCourier}
+                  currentRole="driver"
+                  onSendMessage={handleSendOrderChatMessage}
+                  onSwitchRole={(target) => setRoleView(target)}
+                />
               </>
             )}
           </div>
@@ -1688,377 +1853,846 @@ export default function App() {
       )}
 
       {/* =====================================================================
-          VIEW 3: PAINEL WEB DE DESPACHO (VISÃO RESTAURANTE / GESTOR - MAPUTO)
+          VIEW 3: PAINEL WEB DE DESPACHO & HISTÓRICO DE ENTREGAS (GESTOR / RESTAURANTE)
          ===================================================================== */}
       {roleView === 'dispatch' && (
         <main className="max-w-7xl w-full mx-auto px-4 sm:px-8 py-6 space-y-6">
-          {/* Top KPI Row in Meticais (MT): Volume Diário, Comissão (15%-25%), Suplemento VIP Retido, SLA */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
-              <div className="text-xs text-slate-400">Volume Diário Bruto ({orders.length} pedidos)</div>
-              <div className="font-mono text-2xl font-bold text-white mt-1 tabular-nums">
-                {formatMetical(financialMetrics.grossVolume)}
-              </div>
-              <div className="text-xs text-slate-400 mt-1">
-                {financialMetrics.vipCount} Classe VIP · {financialMetrics.regularCount} Regular
-              </div>
+          {/* Sub-Navigation Bar inside Gestor/Restaurante View: Operação Ativa vs. Histórico de Entregas */}
+          <div className="rounded-2xl bg-slate-900 border border-slate-800 p-3 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800">
+              <button
+                type="button"
+                onClick={() => setDispatchSubView('operations')}
+                className={`min-h-[40px] px-4 py-2 rounded-lg text-xs font-semibold flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                  dispatchSubView === 'operations'
+                    ? 'bg-amber-500 text-slate-950'
+                    : 'text-slate-300 hover:text-white'
+                }`}
+              >
+                <Truck className="w-4 h-4" />
+                <span>Despacho &amp; Monitorização Ativa</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setDispatchSubView('history')}
+                className={`min-h-[40px] px-4 py-2 rounded-lg text-xs font-semibold flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                  dispatchSubView === 'history'
+                    ? 'bg-emerald-500 text-slate-950'
+                    : 'text-slate-300 hover:text-white'
+                }`}
+              >
+                <History className="w-4 h-4" />
+                <span>
+                  Histórico de Entregas ({orders.filter((o) => o.status === 'delivered').length})
+                </span>
+              </button>
             </div>
 
-            <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
-              <div className="flex items-center justify-between text-xs text-slate-400">
-                <span>Taxa de Intermediação ({commissionPercent}%)</span>
-                <span className="font-mono text-emerald-400">15%–25%</span>
-              </div>
-              <div className="font-mono text-2xl font-bold text-emerald-400 mt-1 tabular-nums">
-                {formatMetical(financialMetrics.intermediationFee)}
-              </div>
-              <div className="mt-2 flex items-center gap-2">
-                <input
-                  type="range"
-                  min={15}
-                  max={25}
-                  step={1}
-                  value={commissionPercent}
-                  onChange={(e) => setCommissionPercent(Number(e.target.value))}
-                  className="w-full accent-emerald-400 cursor-pointer"
-                  aria-label="Ajustar percentagem de comissão entre 15% e 25%"
-                />
-              </div>
-            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => handleExportPdf(filteredDeliveredHistory)}
+                className="min-h-[40px] px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-semibold flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <FileText className="w-4 h-4" />
+                <span>Exportar Consolidado PDF</span>
+              </button>
 
-            <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
-              <div className="text-xs text-slate-400">Suplemento Classe VIP Retido</div>
-              <div className="font-mono text-2xl font-bold text-amber-400 mt-1 tabular-nums">
-                {formatMetical(financialMetrics.vipSupplementRetained)}
-              </div>
-              <div className="text-xs text-slate-400 mt-1">
-                Taxa fixa prioritária (150,00 MT / entrega VIP)
-              </div>
-            </div>
-
-            <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
-              <div className="text-xs text-slate-400">Receita Líquida Total da Rede</div>
-              <div className="font-mono text-2xl font-bold text-white mt-1 tabular-nums">
-                {formatMetical(financialMetrics.platformTotalRevenue)}
-              </div>
-              <div className="text-xs text-emerald-400 mt-1">
-                Inclui Assinatura Frota &amp; Destaques
-              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  handleExportCsvReport(
+                    dispatchSubView === 'history' ? filteredDeliveredHistory : orders,
+                    dispatchSubView === 'history'
+                      ? 'historico_entregas_maputo'
+                      : 'relatorio_despacho_maputo'
+                  )
+                }
+                className="min-h-[40px] px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-medium flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+                <span>Exportar CSV (MT)</span>
+              </button>
             </div>
           </div>
 
-          {/* Middle Grid: Quick/Batch Dispatch Form (Left 5 Cols) + Fleet Multi-Marker 2D Map (Right 7 Cols) */}
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            <div className="lg:col-span-5 rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h2 className="font-display text-base font-bold text-white">
-                    Terminal de Despacho Rápido &amp; Em Lote (Maputo)
-                  </h2>
-                  <p className="text-xs text-slate-400">
-                    Alocação imediata para restaurantes parceiros em Maputo
-                  </p>
-                </div>
-                <Truck className="w-5 h-5 text-amber-400" />
-              </div>
-
-              <form onSubmit={handleQuickDispatch} className="space-y-3">
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Estabelecimento / Restaurante Parceiro (Maputo)
-                  </label>
-                  <select
-                    value={dispatchRestaurant}
-                    onChange={(e) => setDispatchRestaurant(Number(e.target.value))}
-                    className="w-full h-10 px-3 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
-                  >
-                    {PRESET_ORIGINS.map((o, idx) => (
-                      <option key={o.label} value={idx}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {/* ===============================================================
+              SUB-VIEW A: HISTÓRICO DE ENTREGAS (FILTRO POR DATA + PDF + CSV)
+             =============================================================== */}
+          {dispatchSubView === 'history' ? (
+            <div className="space-y-6">
+              {/* Filter Bar: Date Range, Quick Date Presets, Category & Search */}
+              <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <label className="block text-xs font-medium text-slate-300 mb-1">
-                      Destino da Entrega em Maputo
+                    <h2 className="font-display text-lg font-bold text-white flex items-center gap-2">
+                      <Calendar className="w-5 h-5 text-emerald-400" />
+                      <span>Histórico de Entregas Concluídas — Filtro por Período</span>
+                    </h2>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Consulte entregas autenticadas via PIN/QR em Maputo, filtre por intervalo de
+                      datas e exporte o relatório consolidado em PDF ou CSV
+                    </p>
+                  </div>
+
+                  {/* Quick Date Range Preset Buttons */}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHistoryStartDate('2026-10-25');
+                        setHistoryEndDate('2026-10-25');
+                      }}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                        historyStartDate === '2026-10-25' && historyEndDate === '2026-10-25'
+                          ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Hoje (25/10)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHistoryStartDate('2026-10-24');
+                        setHistoryEndDate('2026-10-24');
+                      }}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                        historyStartDate === '2026-10-24' && historyEndDate === '2026-10-24'
+                          ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Ontem (24/10)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHistoryStartDate('2026-10-23');
+                        setHistoryEndDate('2026-10-25');
+                      }}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                        historyStartDate === '2026-10-23' && historyEndDate === '2026-10-25'
+                          ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Últimos 3 Dias
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHistoryStartDate('2026-10-21');
+                        setHistoryEndDate('2026-10-25');
+                      }}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                        historyStartDate === '2026-10-21' && historyEndDate === '2026-10-25'
+                          ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Últimos 5 Dias
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHistoryStartDate('');
+                        setHistoryEndDate('');
+                      }}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                        historyStartDate === '' && historyEndDate === ''
+                          ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Todo o Histórico
+                    </button>
+                  </div>
+                </div>
+
+                {/* Date Input Controls + Category Filter + Search */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pt-1">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-400 mb-1">
+                      Data Inicial
+                    </label>
+                    <input
+                      type="date"
+                      value={historyStartDate}
+                      onChange={(e) => setHistoryStartDate(e.target.value)}
+                      className="w-full h-10 px-3 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-white focus:outline-none focus:border-emerald-400"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-400 mb-1">
+                      Data Final
+                    </label>
+                    <input
+                      type="date"
+                      value={historyEndDate}
+                      onChange={(e) => setHistoryEndDate(e.target.value)}
+                      className="w-full h-10 px-3 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-white focus:outline-none focus:border-emerald-400"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-400 mb-1">
+                      Categoria de Serviço
                     </label>
                     <select
-                      value={dispatchDest}
-                      onChange={(e) => setDispatchDest(Number(e.target.value))}
-                      className="w-full h-10 px-3 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
+                      value={historyCategoryFilter}
+                      onChange={(e) =>
+                        setHistoryCategoryFilter(e.target.value as 'all' | 'vip' | 'regular')
+                      }
+                      className="w-full h-10 px-3 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white focus:outline-none focus:border-emerald-400"
                     >
-                      {PRESET_DESTINATIONS.map((d, idx) => (
-                        <option key={d.label} value={idx}>
-                          {d.label}
-                        </option>
-                      ))}
+                      <option value="all">Todas as Categorias (VIP &amp; Regular)</option>
+                      <option value="vip">Apenas Classe VIP (Express Premium)</option>
+                      <option value="regular">Apenas Classe Regular</option>
                     </select>
                   </div>
 
                   <div>
-                    <label className="block text-xs font-medium text-slate-300 mb-1">
-                      Cliente Destinatário
+                    <label className="block text-xs font-medium text-slate-400 mb-1">
+                      Pesquisar Restaurante / Cliente / Código
                     </label>
-                    <input
-                      type="text"
-                      value={dispatchCustomer}
-                      onChange={(e) => setDispatchCustomer(e.target.value)}
-                      className="w-full h-10 px-3 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
-                    />
+                    <div className="relative">
+                      <input
+                        type="text"
+                        value={historySearchQuery}
+                        onChange={(e) => setHistorySearchQuery(e.target.value)}
+                        placeholder="Ex: Polana, EXP-9031..."
+                        className="w-full h-10 pl-9 pr-3 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white focus:outline-none focus:border-emerald-400"
+                      />
+                      <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-3" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Consolidated KPI Cards for Filtered Period */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+                  <div className="text-xs text-slate-400">Entregas no Período Selecionado</div>
+                  <div className="font-mono text-2xl font-bold text-white mt-1 tabular-nums">
+                    {historySummaryMetrics.count} entregas
+                  </div>
+                  <div className="text-xs text-slate-400 mt-1">
+                    {historySummaryMetrics.vipCount} Classe VIP ·{' '}
+                    {historySummaryMetrics.regularCount} Classe Regular
                   </div>
                 </div>
 
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Categoria de Alocação da Frota
-                  </label>
-                  <div className="grid grid-cols-2 gap-2.5">
-                    <button
-                      type="button"
-                      onClick={() => setDispatchCategory('vip')}
-                      className={`h-10 px-3 rounded-xl border text-xs font-semibold cursor-pointer ${
-                        dispatchCategory === 'vip'
-                          ? 'bg-amber-500/15 border-amber-400 text-amber-300'
-                          : 'bg-slate-950 border-slate-800 text-slate-400'
-                      }`}
-                    >
-                      ★ Classe VIP (Imediato)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setDispatchCategory('regular')}
-                      className={`h-10 px-3 rounded-xl border text-xs font-semibold cursor-pointer ${
-                        dispatchCategory === 'regular'
-                          ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
-                          : 'bg-slate-950 border-slate-800 text-slate-400'
-                      }`}
-                    >
-                      ● Classe Regular (Padrão)
-                    </button>
+                <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+                  <div className="text-xs text-slate-400">Volume Faturado Consolidado</div>
+                  <div className="font-mono text-2xl font-bold text-white mt-1 tabular-nums">
+                    {formatMetical(historySummaryMetrics.grossTotal)}
+                  </div>
+                  <div className="text-xs text-slate-400 mt-1">
+                    Frete Base: {formatMetical(historySummaryMetrics.baseTotal)}
                   </div>
                 </div>
 
-                {/* B2B Revenue Streams toggles in Meticais (Section 5 of Business Plan) */}
-                <div className="pt-2 border-t border-slate-800/80 space-y-2 text-xs">
-                  <label className="flex items-center justify-between text-slate-300 cursor-pointer">
-                    <span>Assinatura de Frota Dedicada (+1.200,00 MT/dia)</span>
-                    <input
-                      type="checkbox"
-                      checked={hasDedicatedFleetSub}
-                      onChange={(e) => setHasDedicatedFleetSub(e.target.checked)}
-                      className="accent-amber-400"
-                    />
-                  </label>
-                  <label className="flex items-center justify-between text-slate-300 cursor-pointer">
-                    <span>Destaque Patrocinado no Feed (+750,00 MT/dia)</span>
-                    <input
-                      type="checkbox"
-                      checked={hasSponsoredFeed}
-                      onChange={(e) => setHasSponsoredFeed(e.target.checked)}
-                      className="accent-amber-400"
-                    />
-                  </label>
+                <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+                  <div className="text-xs text-slate-400">
+                    Retenção da Rede ({commissionPercent}% + VIP)
+                  </div>
+                  <div className="font-mono text-2xl font-bold text-amber-400 mt-1 tabular-nums">
+                    {formatMetical(historySummaryMetrics.platformRetained)}
+                  </div>
+                  <div className="text-xs text-slate-400 mt-1">
+                    Comissão: {formatMetical(historySummaryMetrics.commissionTotal)} · VIP:{' '}
+                    {formatMetical(historySummaryMetrics.vipSuppTotal)}
+                  </div>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-2">
-                  <button
-                    type="submit"
-                    className="min-h-[44px] px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>Despachar Pedido Único</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={handleBatchDispatch}
-                    className="min-h-[44px] px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white font-display font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    <Zap className="w-4 h-4 text-amber-400" />
-                    <span>Despachar Lote (3 Motas)</span>
-                  </button>
+                <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+                  <div className="text-xs text-slate-400">Repasse Líquido (Frota / Parceiros)</div>
+                  <div className="font-mono text-2xl font-bold text-emerald-400 mt-1 tabular-nums">
+                    {formatMetical(historySummaryMetrics.partnerNet)}
+                  </div>
+                  <div className="text-xs text-emerald-400 mt-1">
+                    100% Auditado com PIN &amp; Lacre
+                  </div>
                 </div>
-              </form>
-            </div>
+              </div>
 
-            {/* Right 7 Cols: Fleet Overview 2D Vector Map in Maputo */}
-            <div className="lg:col-span-7 space-y-3">
-              <LeafletMap
-                activeOrder={activeOrder}
-                allOrders={orders}
-                couriers={couriers}
-                mode="fleet"
-                onSelectOrder={(id) => setSelectedOrderId(id)}
-                heightClass="h-[380px]"
+              {/* Recharts Analytical View (Filtered by Selected Date Range) */}
+              <DispatchAnalyticsCharts
+                orders={filteredDeliveredHistory}
+                startDate={historyStartDate}
+                endDate={historyEndDate}
+                commissionPercent={commissionPercent}
               />
-            </div>
-          </div>
 
-          {/* Active Deliveries Monitor Table */}
-          <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <h3 className="font-display text-base font-bold text-white">
-                  Monitor de Entregas Ativas em Maputo, SLA &amp; Auditoria de Lacre
-                </h3>
-                <p className="text-xs text-slate-400">
-                  Rastreio em tempo real de todas as motas, códigos PIN e comissões em Meticais (MT)
-                </p>
-              </div>
+              {/* Historical Deliveries Table + Export Bar */}
+              <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="font-display text-base font-bold text-white">
+                      Registo Consolidado de Entregas Finalizadas
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Clique em qualquer entrega para inspecionar a fotografia do lacre térmico ou
+                      perfil do estafeta
+                    </p>
+                  </div>
 
-              <div className="flex flex-wrap items-center gap-2">
-                <div className="flex items-center gap-1 p-1 bg-slate-950 rounded-xl border border-slate-800">
-                  {(['all', 'active', 'delivered'] as const).map((flt) => (
+                  <div className="flex flex-wrap items-center gap-2">
                     <button
-                      key={flt}
                       type="button"
-                      onClick={() => setDispatchFilter(flt)}
-                      className={`px-3 py-1 rounded-lg text-xs font-medium cursor-pointer whitespace-nowrap shrink-0 ${
-                        dispatchFilter === flt
-                          ? 'bg-slate-800 text-white font-semibold'
-                          : 'text-slate-400 hover:text-slate-200'
-                      }`}
+                      disabled={filteredDeliveredHistory.length === 0}
+                      onClick={() => handleExportPdf(filteredDeliveredHistory)}
+                      className="min-h-[40px] px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 text-xs font-semibold flex items-center gap-2 cursor-pointer whitespace-nowrap shrink-0"
                     >
-                      {flt === 'all' && 'Todas'}
-                      {flt === 'active' && 'Em Curso'}
-                      {flt === 'delivered' && 'Concluídas'}
+                      <FileText className="w-4 h-4" />
+                      <span>Exportar Relatório Consolidado (PDF)</span>
                     </button>
-                  ))}
+
+                    <button
+                      type="button"
+                      disabled={filteredDeliveredHistory.length === 0}
+                      onClick={() =>
+                        handleExportCsvReport(
+                          filteredDeliveredHistory,
+                          'relatorio_historico_consolidado_maputo'
+                        )
+                      }
+                      className="min-h-[40px] px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-100 text-xs font-medium flex items-center gap-2 cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <Download className="w-4 h-4 text-emerald-400" />
+                      <span>Exportar Histórico (CSV)</span>
+                    </button>
+                  </div>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={handleExportCsvReport}
-                  className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
-                >
-                  <Download className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Exportar Relatório CSV (MT)</span>
-                </button>
+                {filteredDeliveredHistory.length === 0 ? (
+                  <div className="rounded-2xl bg-slate-950 border border-slate-800 p-8 text-center space-y-3">
+                    <Filter className="w-8 h-8 text-slate-500 mx-auto" />
+                    <div className="text-sm font-semibold text-white">
+                      Nenhuma entrega concluída encontrada neste intervalo de datas
+                    </div>
+                    <p className="text-xs text-slate-400 max-w-md mx-auto">
+                      Ajuste a Data Inicial / Data Final ou clique abaixo para mostrar todas as
+                      entregas concluídas registadas em Maputo.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHistoryStartDate('');
+                        setHistoryEndDate('');
+                        setHistoryCategoryFilter('all');
+                        setHistorySearchQuery('');
+                      }}
+                      className="px-4 py-2 rounded-xl bg-emerald-500 text-slate-950 text-xs font-semibold cursor-pointer"
+                    >
+                      Limpar Filtros de Data
+                    </button>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-800 text-slate-400">
+                          <th className="py-3 pr-3 font-semibold">Código</th>
+                          <th className="py-3 px-3 font-semibold">Data &amp; Hora</th>
+                          <th className="py-3 px-3 font-semibold">Categoria</th>
+                          <th className="py-3 px-3 font-semibold">Restaurante → Destino</th>
+                          <th className="py-3 px-3 font-semibold">Estafeta</th>
+                          <th className="py-3 px-3 font-semibold">Lacre Térmico</th>
+                          <th className="py-3 px-3 font-semibold text-center">PIN / Aval.</th>
+                          <th className="py-3 pl-3 font-semibold text-right">
+                            Total / Retido (MT)
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70">
+                        {filteredDeliveredHistory.map((order) => {
+                          const courier = couriers.find((c) => c.id === order.assignedCourierId);
+                          const isVip = order.category === 'vip';
+                          const comm =
+                            (order.basePrice * commissionPercent) / 100 + order.vipSupplement;
+
+                          return (
+                            <tr
+                              key={order.id}
+                              onClick={() => setPreviewSealOrder(order)}
+                              className="hover:bg-slate-800/40 transition-colors cursor-pointer"
+                            >
+                              <td className="py-3 pr-3 font-mono font-bold text-white whitespace-nowrap">
+                                {order.code}
+                              </td>
+                              <td className="py-3 px-3 font-mono tabular-nums whitespace-nowrap">
+                                <div className="text-slate-200">{order.dateIso}</div>
+                                <div className="text-[11px] text-emerald-400">
+                                  Concluído às {order.deliveredAt || order.createdAt}
+                                </div>
+                              </td>
+                              <td className="py-3 px-3 whitespace-nowrap">
+                                <span
+                                  className={
+                                    isVip
+                                      ? 'text-amber-400 font-semibold'
+                                      : 'text-emerald-400 font-medium'
+                                  }
+                                >
+                                  {isVip ? '★ Classe VIP' : '● Regular'}
+                                </span>
+                              </td>
+                              <td className="py-3 px-3">
+                                <div className="font-medium text-slate-200 truncate max-w-[230px]">
+                                  {order.restaurantName}
+                                </div>
+                                <div className="text-[11px] text-slate-400 truncate max-w-[230px]">
+                                  → {order.destination.label} ({order.customerName})
+                                </div>
+                              </td>
+                              <td className="py-3 px-3 whitespace-nowrap">
+                                {courier ? (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setStoryCourier(courier);
+                                    }}
+                                    className="text-left hover:underline text-slate-200 cursor-pointer"
+                                  >
+                                    <div className="font-medium">{courier.name}</div>
+                                    <div className="text-[11px] font-mono text-slate-400">
+                                      {courier.vehiclePlate}
+                                    </div>
+                                  </button>
+                                ) : (
+                                  '—'
+                                )}
+                              </td>
+                              <td className="py-3 px-3 whitespace-nowrap font-mono">
+                                {order.sealInspection ? (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setPreviewSealOrder(order);
+                                    }}
+                                    className="text-emerald-400 hover:underline cursor-pointer"
+                                  >
+                                    ✓ #{order.sealInspection.sealCode}
+                                  </button>
+                                ) : (
+                                  <span className="text-slate-400">Verificado</span>
+                                )}
+                              </td>
+                              <td className="py-3 px-3 text-center font-mono tabular-nums whitespace-nowrap">
+                                <div className="text-amber-300 font-bold">PIN {order.pinCode}</div>
+                                <div className="text-[11px] text-slate-300">
+                                  {order.clientRating || 5}.0 ★
+                                </div>
+                              </td>
+                              <td className="py-3 pl-3 text-right font-mono tabular-nums whitespace-nowrap">
+                                <div className="font-bold text-white">
+                                  {formatMetical(order.totalPrice)}
+                                </div>
+                                <div className="text-[11px] text-emerald-400">
+                                  Rede: {formatMetical(comm)}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </div>
+          ) : (
+            /* ===============================================================
+                SUB-VIEW B: OPERAÇÃO ATIVA & TERMINAL DE DESPACHO
+               =============================================================== */
+            <>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+                  <div className="text-xs text-slate-400">
+                    Volume Bruto Global ({orders.length} pedidos)
+                  </div>
+                  <div className="font-mono text-2xl font-bold text-white mt-1 tabular-nums">
+                    {formatMetical(financialMetrics.grossVolume)}
+                  </div>
+                  <div className="text-xs text-slate-400 mt-1">
+                    {financialMetrics.vipCount} Classe VIP · {financialMetrics.regularCount} Regular
+                  </div>
+                </div>
 
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse text-xs">
-                <thead>
-                  <tr className="border-b border-slate-800 text-slate-400">
-                    <th className="py-3 pr-3 font-semibold">Pedido</th>
-                    <th className="py-3 px-3 font-semibold">Categoria</th>
-                    <th className="py-3 px-3 font-semibold">Restaurante → Cliente (Maputo)</th>
-                    <th className="py-3 px-3 font-semibold">Estafeta Atribuído</th>
-                    <th className="py-3 px-3 font-semibold">Lacre Térmico</th>
-                    <th className="py-3 px-3 font-semibold">SLA / Estado</th>
-                    <th className="py-3 px-3 font-semibold text-right">PIN</th>
-                    <th className="py-3 pl-3 font-semibold text-right">Total / Comissão (MT)</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800/70">
-                  {orders
-                    .filter((o) => {
-                      if (dispatchFilter === 'active') return o.status !== 'delivered';
-                      if (dispatchFilter === 'delivered') return o.status === 'delivered';
-                      return true;
-                    })
-                    .map((order) => {
-                      const courier = couriers.find((c) => c.id === order.assignedCourierId);
-                      const isVip = order.category === 'vip';
-                      const comm = (order.basePrice * commissionPercent) / 100 + order.vipSupplement;
+                <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+                  <div className="flex items-center justify-between text-xs text-slate-400">
+                    <span>Taxa de Intermediação ({commissionPercent}%)</span>
+                    <span className="font-mono text-emerald-400">15%–25%</span>
+                  </div>
+                  <div className="font-mono text-2xl font-bold text-emerald-400 mt-1 tabular-nums">
+                    {formatMetical(financialMetrics.intermediationFee)}
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <input
+                      type="range"
+                      min={15}
+                      max={25}
+                      step={1}
+                      value={commissionPercent}
+                      onChange={(e) => setCommissionPercent(Number(e.target.value))}
+                      className="w-full accent-emerald-400 cursor-pointer"
+                      aria-label="Ajustar percentagem de comissão entre 15% e 25%"
+                    />
+                  </div>
+                </div>
 
-                      return (
-                        <tr
-                          key={order.id}
-                          onClick={() => setSelectedOrderId(order.id)}
-                          className="hover:bg-slate-800/40 transition-colors cursor-pointer"
+                <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+                  <div className="text-xs text-slate-400">Suplemento Classe VIP Retido</div>
+                  <div className="font-mono text-2xl font-bold text-amber-400 mt-1 tabular-nums">
+                    {formatMetical(financialMetrics.vipSupplementRetained)}
+                  </div>
+                  <div className="text-xs text-slate-400 mt-1">
+                    Taxa fixa prioritária (150,00 MT / entrega VIP)
+                  </div>
+                </div>
+
+                <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+                  <div className="text-xs text-slate-400">Receita Líquida Total da Rede</div>
+                  <div className="font-mono text-2xl font-bold text-white mt-1 tabular-nums">
+                    {formatMetical(financialMetrics.platformTotalRevenue)}
+                  </div>
+                  <div className="text-xs text-emerald-400 mt-1">
+                    Inclui Assinatura Frota &amp; Destaques
+                  </div>
+                </div>
+              </div>
+
+              {/* Recharts Analytical View in Operations Sub-View */}
+              <DispatchAnalyticsCharts
+                orders={orders}
+                startDate={historyStartDate}
+                endDate={historyEndDate}
+                commissionPercent={commissionPercent}
+              />
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <div className="lg:col-span-5 rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h2 className="font-display text-base font-bold text-white">
+                        Terminal de Despacho Rápido &amp; Em Lote (Maputo)
+                      </h2>
+                      <p className="text-xs text-slate-400">
+                        Alocação imediata para restaurantes parceiros em Maputo
+                      </p>
+                    </div>
+                    <Truck className="w-5 h-5 text-amber-400" />
+                  </div>
+
+                  <form onSubmit={handleQuickDispatch} className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-300 mb-1">
+                        Estabelecimento / Restaurante Parceiro (Maputo)
+                      </label>
+                      <select
+                        value={dispatchRestaurant}
+                        onChange={(e) => setDispatchRestaurant(Number(e.target.value))}
+                        className="w-full h-10 px-3 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
+                      >
+                        {PRESET_ORIGINS.map((o, idx) => (
+                          <option key={o.label} value={idx}>
+                            {o.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs font-medium text-slate-300 mb-1">
+                          Destino da Entrega em Maputo
+                        </label>
+                        <select
+                          value={dispatchDest}
+                          onChange={(e) => setDispatchDest(Number(e.target.value))}
+                          className="w-full h-10 px-3 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
                         >
-                          <td className="py-3 pr-3 font-mono font-bold text-white whitespace-nowrap">
-                            {order.code}
-                          </td>
-                          <td className="py-3 px-3 whitespace-nowrap">
-                            <span
-                              className={
-                                isVip
-                                  ? 'text-amber-400 font-semibold'
-                                  : 'text-emerald-400 font-medium'
-                              }
+                          {PRESET_DESTINATIONS.map((d, idx) => (
+                            <option key={d.label} value={idx}>
+                              {d.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-300 mb-1">
+                          Cliente Destinatário
+                        </label>
+                        <input
+                          type="text"
+                          value={dispatchCustomer}
+                          onChange={(e) => setDispatchCustomer(e.target.value)}
+                          className="w-full h-10 px-3 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-300 mb-1">
+                        Categoria de Alocação da Frota
+                      </label>
+                      <div className="grid grid-cols-2 gap-2.5">
+                        <button
+                          type="button"
+                          onClick={() => setDispatchCategory('vip')}
+                          className={`h-10 px-3 rounded-xl border text-xs font-semibold cursor-pointer ${
+                            dispatchCategory === 'vip'
+                              ? 'bg-amber-500/15 border-amber-400 text-amber-300'
+                              : 'bg-slate-950 border-slate-800 text-slate-400'
+                          }`}
+                        >
+                          ★ Classe VIP (Imediato)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDispatchCategory('regular')}
+                          className={`h-10 px-3 rounded-xl border text-xs font-semibold cursor-pointer ${
+                            dispatchCategory === 'regular'
+                              ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                              : 'bg-slate-950 border-slate-800 text-slate-400'
+                          }`}
+                        >
+                          ● Classe Regular (Padrão)
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="pt-2 border-t border-slate-800/80 space-y-2 text-xs">
+                      <label className="flex items-center justify-between text-slate-300 cursor-pointer">
+                        <span>Assinatura de Frota Dedicada (+1.200,00 MT/dia)</span>
+                        <input
+                          type="checkbox"
+                          checked={hasDedicatedFleetSub}
+                          onChange={(e) => setHasDedicatedFleetSub(e.target.checked)}
+                          className="accent-amber-400"
+                        />
+                      </label>
+                      <label className="flex items-center justify-between text-slate-300 cursor-pointer">
+                        <span>Destaque Patrocinado no Feed (+750,00 MT/dia)</span>
+                        <input
+                          type="checkbox"
+                          checked={hasSponsoredFeed}
+                          onChange={(e) => setHasSponsoredFeed(e.target.checked)}
+                          className="accent-amber-400"
+                        />
+                      </label>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-2">
+                      <button
+                        type="submit"
+                        className="min-h-[44px] px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
+                      >
+                        <Plus className="w-4 h-4" />
+                        <span>Despachar Pedido Único</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleBatchDispatch}
+                        className="min-h-[44px] px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white font-display font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
+                      >
+                        <Zap className="w-4 h-4 text-amber-400" />
+                        <span>Despachar Lote (3 Motas)</span>
+                      </button>
+                    </div>
+                  </form>
+                </div>
+
+                <div className="lg:col-span-7 space-y-3">
+                  <LeafletMap
+                    activeOrder={activeOrder}
+                    allOrders={orders}
+                    couriers={couriers}
+                    mode="fleet"
+                    onSelectOrder={(id) => setSelectedOrderId(id)}
+                    heightClass="h-[380px]"
+                  />
+                </div>
+              </div>
+
+              <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="font-display text-base font-bold text-white">
+                      Monitor de Entregas Ativas em Maputo, SLA &amp; Auditoria de Lacre
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Rastreio em tempo real de todas as motas, códigos PIN e comissões em Meticais (MT)
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="flex items-center gap-1 p-1 bg-slate-950 rounded-xl border border-slate-800">
+                      {(['all', 'active', 'delivered'] as const).map((flt) => (
+                        <button
+                          key={flt}
+                          type="button"
+                          onClick={() => setDispatchFilter(flt)}
+                          className={`px-3 py-1 rounded-lg text-xs font-medium cursor-pointer whitespace-nowrap shrink-0 ${
+                            dispatchFilter === flt
+                              ? 'bg-slate-800 text-white font-semibold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {flt === 'all' && 'Todas'}
+                          {flt === 'active' && 'Em Curso'}
+                          {flt === 'delivered' && 'Concluídas'}
+                        </button>
+                      ))}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setDispatchSubView('history')}
+                      className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-xs font-semibold text-emerald-300 flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <History className="w-3.5 h-3.5" />
+                      <span>Filtrar por Data &amp; PDF</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="border-b border-slate-800 text-slate-400">
+                        <th className="py-3 pr-3 font-semibold">Pedido</th>
+                        <th className="py-3 px-3 font-semibold">Data</th>
+                        <th className="py-3 px-3 font-semibold">Categoria</th>
+                        <th className="py-3 px-3 font-semibold">Restaurante → Cliente (Maputo)</th>
+                        <th className="py-3 px-3 font-semibold">Estafeta Atribuído</th>
+                        <th className="py-3 px-3 font-semibold">Lacre Térmico</th>
+                        <th className="py-3 px-3 font-semibold">SLA / Estado</th>
+                        <th className="py-3 px-3 font-semibold text-right">PIN</th>
+                        <th className="py-3 pl-3 font-semibold text-right">Total / Comissão (MT)</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/70">
+                      {orders
+                        .filter((o) => {
+                          if (dispatchFilter === 'active') return o.status !== 'delivered';
+                          if (dispatchFilter === 'delivered') return o.status === 'delivered';
+                          return true;
+                        })
+                        .map((order) => {
+                          const courier = couriers.find((c) => c.id === order.assignedCourierId);
+                          const isVip = order.category === 'vip';
+                          const comm =
+                            (order.basePrice * commissionPercent) / 100 + order.vipSupplement;
+
+                          return (
+                            <tr
+                              key={order.id}
+                              onClick={() => setSelectedOrderId(order.id)}
+                              className="hover:bg-slate-800/40 transition-colors cursor-pointer"
                             >
-                              {isVip ? '★ Classe VIP' : '● Regular'}
-                            </span>
-                          </td>
-                          <td className="py-3 px-3">
-                            <div className="font-medium text-slate-200 truncate max-w-[220px]">
-                              {order.restaurantName}
-                            </div>
-                            <div className="text-[11px] text-slate-400 truncate max-w-[220px]">
-                              → {order.destination.label} ({order.customerName})
-                            </div>
-                          </td>
-                          <td className="py-3 px-3 whitespace-nowrap">
-                            {courier ? (
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setStoryCourier(courier);
-                                }}
-                                className="text-left hover:underline text-slate-200 cursor-pointer"
-                              >
-                                <div className="font-medium">{courier.name}</div>
-                                <div className="text-[11px] font-mono text-slate-400">
-                                  {courier.vehiclePlate} · {courier.thermalTempHot.toFixed(1)}°C
+                              <td className="py-3 pr-3 font-mono font-bold text-white whitespace-nowrap">
+                                {order.code}
+                              </td>
+                              <td className="py-3 px-3 font-mono text-slate-300 whitespace-nowrap">
+                                {order.dateIso}
+                              </td>
+                              <td className="py-3 px-3 whitespace-nowrap">
+                                <span
+                                  className={
+                                    isVip
+                                      ? 'text-amber-400 font-semibold'
+                                      : 'text-emerald-400 font-medium'
+                                  }
+                                >
+                                  {isVip ? '★ Classe VIP' : '● Regular'}
+                                </span>
+                              </td>
+                              <td className="py-3 px-3">
+                                <div className="font-medium text-slate-200 truncate max-w-[220px]">
+                                  {order.restaurantName}
                                 </div>
-                              </button>
-                            ) : (
-                              '—'
-                            )}
-                          </td>
-                          <td className="py-3 px-3 whitespace-nowrap font-mono">
-                            {order.sealInspection ? (
-                              <span className="text-emerald-400">
-                                ✓ #{order.sealInspection.sealCode}
-                              </span>
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setSealModalOrder(order);
-                                }}
-                                className="text-amber-400 underline cursor-pointer"
-                              >
-                                Registar Lacre
-                              </button>
-                            )}
-                          </td>
-                          <td className="py-3 px-3 whitespace-nowrap">
-                            <div className="text-slate-200">{formatStatusLabel(order.status)}</div>
-                            <div className="text-[11px] font-mono text-slate-400 tabular-nums">
-                              Alvo SLA: {order.slaTargetMinutes} min ({order.routeProgress}%)
-                            </div>
-                          </td>
-                          <td className="py-3 px-3 text-right font-mono font-bold text-amber-300 tabular-nums">
-                            {order.pinCode}
-                          </td>
-                          <td className="py-3 pl-3 text-right font-mono tabular-nums whitespace-nowrap">
-                            <div className="font-bold text-white">
-                              {formatMetical(order.totalPrice)}
-                            </div>
-                            <div className="text-[11px] text-emerald-400">
-                              Rede: {formatMetical(comm)}
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                </tbody>
-              </table>
-            </div>
-          </div>
+                                <div className="text-[11px] text-slate-400 truncate max-w-[220px]">
+                                  → {order.destination.label} ({order.customerName})
+                                </div>
+                              </td>
+                              <td className="py-3 px-3 whitespace-nowrap">
+                                {courier ? (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setStoryCourier(courier);
+                                    }}
+                                    className="text-left hover:underline text-slate-200 cursor-pointer"
+                                  >
+                                    <div className="font-medium">{courier.name}</div>
+                                    <div className="text-[11px] font-mono text-slate-400">
+                                      {courier.vehiclePlate} · {courier.thermalTempHot.toFixed(1)}°C
+                                    </div>
+                                  </button>
+                                ) : (
+                                  '—'
+                                )}
+                              </td>
+                              <td className="py-3 px-3 whitespace-nowrap font-mono">
+                                {order.sealInspection ? (
+                                  <span className="text-emerald-400">
+                                    ✓ #{order.sealInspection.sealCode}
+                                  </span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setSealModalOrder(order);
+                                    }}
+                                    className="text-amber-400 underline cursor-pointer"
+                                  >
+                                    Registar Lacre
+                                  </button>
+                                )}
+                              </td>
+                              <td className="py-3 px-3 whitespace-nowrap">
+                                <div className="text-slate-200">
+                                  {formatStatusLabel(order.status)}
+                                </div>
+                                <div className="text-[11px] font-mono text-slate-400 tabular-nums">
+                                  Alvo SLA: {order.slaTargetMinutes} min ({order.routeProgress}%)
+                                </div>
+                              </td>
+                              <td className="py-3 px-3 text-right font-mono font-bold text-amber-300 tabular-nums">
+                                {order.pinCode}
+                              </td>
+                              <td className="py-3 pl-3 text-right font-mono tabular-nums whitespace-nowrap">
+                                <div className="font-bold text-white">
+                                  {formatMetical(order.totalPrice)}
+                                </div>
+                                <div className="text-[11px] text-emerald-400">
+                                  Rede: {formatMetical(comm)}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          )}
         </main>
       )}
 
-      {/* MOBILE BOTTOM NAVIGATION BAR (Thumb-Zone Ergonomics <= 15% Viewport Cap) */}
+      {/* MOBILE BOTTOM NAVIGATION BAR */}
       <nav
         className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-slate-950/95 backdrop-blur-md border-t border-slate-800 grid grid-cols-4 items-center h-16 px-2"
         aria-label="Navegação Mobile"
@@ -2087,9 +2721,14 @@ export default function App() {
 
         <button
           type="button"
-          onClick={() => setRoleView('dispatch')}
+          onClick={() => {
+            setRoleView('dispatch');
+            setDispatchSubView('operations');
+          }}
           className={`flex flex-col items-center justify-center min-h-[44px] cursor-pointer ${
-            roleView === 'dispatch' ? 'text-amber-400' : 'text-slate-400'
+            roleView === 'dispatch' && dispatchSubView === 'operations'
+              ? 'text-amber-400'
+              : 'text-slate-400'
           }`}
         >
           <Building2 className="w-5 h-5" />
@@ -2098,11 +2737,18 @@ export default function App() {
 
         <button
           type="button"
-          onClick={() => setIsHostingerModalOpen(true)}
-          className="flex flex-col items-center justify-center min-h-[44px] text-slate-400 hover:text-amber-400 cursor-pointer"
+          onClick={() => {
+            setRoleView('dispatch');
+            setDispatchSubView('history');
+          }}
+          className={`flex flex-col items-center justify-center min-h-[44px] cursor-pointer ${
+            roleView === 'dispatch' && dispatchSubView === 'history'
+              ? 'text-emerald-400'
+              : 'text-slate-400'
+          }`}
         >
-          <FileCode className="w-5 h-5" />
-          <span className="text-[10px] font-medium mt-1">Hostinger</span>
+          <History className="w-5 h-5" />
+          <span className="text-[10px] font-medium mt-1">Histórico</span>
         </button>
       </nav>
 
@@ -2120,6 +2766,73 @@ export default function App() {
         isOpen={isHostingerModalOpen}
         onClose={() => setIsHostingerModalOpen(false)}
       />
+
+      {/* Historical Order Seal Inspection Preview Modal */}
+      {previewSealOrder && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 backdrop-blur-md p-4"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="w-full max-w-lg rounded-3xl bg-slate-900 border border-slate-800 p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div>
+                <h3 className="font-display text-base font-bold text-white">
+                  Auditoria de Entrega Concluída · {previewSealOrder.code}
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Data: {previewSealOrder.dateIso} às{' '}
+                  {previewSealOrder.deliveredAt || previewSealOrder.createdAt} · PIN{' '}
+                  {previewSealOrder.pinCode}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPreviewSealOrder(null)}
+                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 cursor-pointer"
+              >
+                Fechar
+              </button>
+            </div>
+
+            {previewSealOrder.sealInspection && (
+              <div className="rounded-2xl overflow-hidden border border-slate-800 bg-slate-950">
+                <img
+                  src={previewSealOrder.sealInspection.dataUrl}
+                  alt={`Evidência de lacre ${previewSealOrder.sealInspection.sealCode}`}
+                  referrerPolicy="no-referrer"
+                  className="w-full h-52 object-cover"
+                />
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
+                <span className="text-slate-400 block">Origem (Maputo)</span>
+                <span className="font-semibold text-white">
+                  {previewSealOrder.restaurantName}
+                </span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
+                <span className="text-slate-400 block">Destino / Cliente</span>
+                <span className="font-semibold text-white">
+                  {previewSealOrder.destination.label} ({previewSealOrder.customerName})
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between pt-1">
+              <span className="text-xs text-slate-400">
+                Lacre: {previewSealOrder.sealInspection?.sealCode || 'Verificado'} · Avaliação:{' '}
+                {previewSealOrder.clientRating || 5} ★
+              </span>
+              <span className="font-mono font-bold text-base text-amber-400">
+                {formatMetical(previewSealOrder.totalPrice)}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* iOS Safari Guided Install Modal */}
       {showIOSInstallModal && (

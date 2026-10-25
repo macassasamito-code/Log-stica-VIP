@@ -59,9 +59,19 @@ export interface SealInspectionRecord {
   dataUrl: string;
 }
 
+export interface OrderChatMessage {
+  id: string;
+  sender: 'client' | 'driver' | 'system';
+  senderName: string;
+  text: string;
+  timestamp: string;
+  contextTag?: string;
+}
+
 export interface DeliveryOrder {
   id: string;
   code: string;
+  dateIso: string; // YYYY-MM-DD for historical filtering
   createdAt: string;
   restaurantName: string;
   customerName: string;
@@ -84,8 +94,10 @@ export interface DeliveryOrder {
   qrPayload: string;
   assignedCourierId: string;
   sealInspection?: SealInspectionRecord;
+  chatMessages?: OrderChatMessage[];
   deliveredAt?: string;
   clientRating?: number;
   driverRating?: number;
   isBatchOrder?: boolean;
 }
+
