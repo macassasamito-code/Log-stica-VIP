@@ -98,7 +98,13 @@ export default defineConfig(() => {
     ],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(import.meta.dirname, '.'),
+      },
+    },
+    build: {
+      chunkSizeWarningLimit: 2500,
+      rollupOptions: {
+        external: ['react-is'],
       },
     },
     server: {
@@ -110,3 +116,4 @@ export default defineConfig(() => {
     },
   };
 });
+
