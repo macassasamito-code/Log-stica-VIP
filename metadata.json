@@ -1,0 +1,6 @@
+{
+  "name": "Rede de Delivery VIP & Express — App Express Transparente",
+  "description": "Plataforma de intermediação de entregas rápidas (Classe Regular e Classe VIP Express Premium) com rastreio 2D em tempo real, Stories de inspeção da frota, validação por PIN/QR Code, fotografia de lacre térmico e painel web de despacho.",
+  "requestFramePermissions": ["camera", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

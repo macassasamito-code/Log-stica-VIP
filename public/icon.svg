@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#1e293b" />
+    </linearGradient>
+    <linearGradient id="goldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fbbf24" />
+      <stop offset="100%" stop-color="#d97706" />
+    </linearGradient>
+    <linearGradient id="emeraldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399" />
+      <stop offset="100%" stop-color="#059669" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)" />
+  <rect x="24" y="24" width="464" height="464" rx="92" fill="none" stroke="url(#goldGrad)" stroke-width="6" opacity="0.4" />
+  <!-- Shield / Express Emblem -->
+  <path d="M256 96 L384 148 V248 C384 336 328 402 256 428 C184 402 128 336 128 248 V148 Z" fill="#1e293b" stroke="url(#goldGrad)" stroke-width="14" stroke-linejoin="round" />
+  <!-- Express Lightning / Route Vector -->
+  <path d="M276 154 L196 266 H258 L236 362 L324 242 H260 Z" fill="url(#goldGrad)" />
+  <!-- Verified Status Ring -->
+  <circle cx="356" cy="356" r="44" fill="url(#emeraldGrad)" stroke="#0f172a" stroke-width="10" />
+  <path d="M338 356 L350 368 L376 342" fill="none" stroke="#ffffff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" />
+</svg>
